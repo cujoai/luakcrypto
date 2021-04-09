@@ -91,17 +91,17 @@ LIST_HEAD(hasher_names_list);
 static int get_status(struct hash_lock_t *state)
 {
 	int status = 0;
-	spin_lock(&state->lock);
+	spin_lock_bh(&state->lock);
 	status = state->status;
-	spin_unlock(&state->lock);
+	spin_unlock_bh(&state->lock);
 	return status;
 }
 
 static void set_status(struct hash_lock_t *state, int value)
 {
-	spin_lock(&state->lock);
+	spin_lock_bh(&state->lock);
 	state->status = value;
-	spin_unlock(&state->lock);
+	spin_unlock_bh(&state->lock);
 }
 
 static void delete_list_items(struct list_head *name_list)
