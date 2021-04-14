@@ -10,6 +10,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/scatterlist.h>
+#include <linux/completion.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
 #include <crypto/skcipher.h>
 #endif
@@ -22,6 +23,9 @@
 
 static const char CUJO_CIPHER_TFM_LUA_NAME[] = "cipher_tfm";
 static const char CUJO_HASHER_TFM_LUA_NAME[] = "hasher_tfm";
+
+static DECLARE_COMPLETION(hasher_needs_init);
+static DECLARE_COMPLETION(cipher_needs_init);
 
 enum { CIPHER, HASHER };
 enum {
@@ -76,8 +80,6 @@ struct cipher_tfm_t {
 #endif
 };
 
-struct task_struct *cipher_task = NULL;
-struct task_struct *hasher_task = NULL;
 struct hash_lock_t cipher = {
 	0,
 };
@@ -298,11 +300,15 @@ static int cache_warm(int tfm_type, struct hash_lock_t *state,
 
 static int hasher_cache_warm(void *arg)
 {
-	return cache_warm(HASHER, &hash, &hasher_names_list);
+	if (!wait_for_completion_killable(&hasher_needs_init))
+		return cache_warm(HASHER, &hash, &hasher_names_list);
+	return -1;
 }
 static int cipher_cache_warm(void *arg)
 {
-	return cache_warm(CIPHER, &cipher, &cipher_names_list);
+	if (!wait_for_completion_killable(&cipher_needs_init))
+		return cache_warm(CIPHER, &cipher, &cipher_names_list);
+	return -1;
 }
 
 static int ldecrypt(lua_State *L)
@@ -322,7 +328,7 @@ static int lencrypt(lua_State *L)
 }
 
 static int init(lua_State *L, struct hash_lock_t *state, struct list_head *list,
-		struct task_struct *task)
+		struct completion *task)
 {
 	u8 *name = NULL;
 	struct names_list_t *tmp = NULL;
@@ -353,7 +359,7 @@ static int init(lua_State *L, struct hash_lock_t *state, struct list_head *list,
 
 	set_status(state, IN_PROGRESS);
 
-	wake_up_process(task);
+	complete(task);
 	return 0;
 }
 
@@ -362,20 +368,21 @@ static int init(lua_State *L, struct hash_lock_t *state, struct list_head *list,
 *  whereis lua interpeter is running in atomic context we cannot execute
 *  any blocking calls or busy waiting outside of either module_init or
 *  separate kernel threads. As such we could register new kernel threads
-*  only in module_init routine. Due to this `wake_up_process` could wake up
-*  registered thread only once per module initialization thus user could
-*  set new set of ciphers/hashers via `init_cipher`/`init_hasher` only once
-*  per module initialization
+*  only in module_init routine. User could set new set of ciphers/hashers
+*  via `init_cipher`/`init_hasher` only once per module initialization
+*
+*  TODO drop the above limitation and let user set new ciphers during uptime
+*  that requires more complicated "state" management.
 */
 
 static int init_cipher(lua_State *L)
 {
-	return init(L, &cipher, &cipher_names_list, cipher_task);
+	return init(L, &cipher, &cipher_names_list, &cipher_needs_init);
 }
 
 static int init_hasher(lua_State *L)
 {
-	return init(L, &hash, &hasher_names_list, hasher_task);
+	return init(L, &hash, &hasher_names_list, &hasher_needs_init);
 }
 
 static int cipher_tfm_gc(lua_State *L)
@@ -488,10 +495,8 @@ int luaopen_kcrypto(lua_State *L)
 
 static int __init modinit(void)
 {
-	cipher_task =
-		kthread_create(cipher_cache_warm, NULL, "cipher_cache_warm");
-	hasher_task =
-		kthread_create(hasher_cache_warm, NULL, "hasher_cache_warm");
+	kthread_run(cipher_cache_warm, NULL, "cipher_cache_warm");
+	kthread_run(hasher_cache_warm, NULL, "hasher_cache_warm");
 	spin_lock_init(&hash.lock);
 	spin_lock_init(&cipher.lock);
 	set_status(&cipher, INIT);
