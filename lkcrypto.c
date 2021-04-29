@@ -119,7 +119,7 @@ static void delete_list_items(struct list_head *name_list)
 }
 
 static int enc_dec(struct cipher_tfm_t *tfm, const u8 *key, size_t key_len,
-		   const u8 *iv, size_t iv_len, const u8 *input_buffer,
+		   u8 *iv, size_t iv_len, const u8 *input_buffer,
 		   size_t input_buffer_len, int encdec)
 {
 	struct cipher_def def;
@@ -330,7 +330,7 @@ static int lencrypt(lua_State *L)
 static int init(lua_State *L, struct hash_lock_t *state, struct list_head *list,
 		struct completion *task)
 {
-	u8 *name = NULL;
+	const u8 *name = NULL;
 	struct names_list_t *tmp = NULL;
 	int nargs = 0;
 	int i = 1;
