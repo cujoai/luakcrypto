@@ -207,7 +207,17 @@ static int enc_dec_aead(struct cipher_aead_tfm_t *tfm, const u8 *key,
 	if (ret) {
 		return ret;
 	}
-
+	//!Important!
+	//It is desired to have stack allocated buffers
+	//for small fixed-size scatterted lists but it is not working
+	//properly on some platfroms(for instance KVMs)
+	//the reason behind it is not fully investigated but the problem (likely)
+	//is incorrect virt memory address for stack allocated memory and thus
+	//sg_set_buf crashes
+	//The root cause could be easily verified with CONFIG_DEBUG_SG enalbed
+	//so BUG_ON(!virt_addr_valid(buf)); would fire
+	//thus for all sg_set_buf operations we use only heap allocated memory
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 0)
 	if (aad_len > 0) {
 		sg_init_table(sg, 3);
 		sg_set_buf(&sg[0], aad, aad_len);
@@ -218,12 +228,18 @@ static int enc_dec_aead(struct cipher_aead_tfm_t *tfm, const u8 *key,
 		sg_set_buf(&sg[0], input_buffer, input_buffer_len);
 		sg_set_buf(&sg[1], auth, auth_len);
 	}
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 0)
+
 	aead_request_set_ad(tfm->req, aad_len);
 #else
-	aead_request_set_assoc(tfm->req, sg, aad_len);
+	struct scatterlist asg;
+	sg_init_table(sg, 2);
+	sg_set_buf(&sg[0], input_buffer, input_buffer_len);
+	sg_set_buf(&sg[1], auth, auth_len);
+	if (aad_len > 0) {
+		sg_init_one(&asg, aad, aad_len);
+	}
+	aead_request_set_assoc(tfm->req, &asg, aad_len);
 #endif
-
 	if (operation == ENCODING) {
 		aead_request_set_crypt(tfm->req, sg, sg, input_buffer_len, iv);
 	} else {
@@ -279,7 +295,7 @@ static int decrypt_encrypt(lua_State *L, enum enc_dec operation)
 		return 1;
 	} else {
 		kfree(buffer);
-		return luaL_error(L, "%s failed ",
+		return luaL_error(L, "%s failed",
 				  operation == ENCODING ? "encrypt" :
 							  "decrypt");
 	}
@@ -324,9 +340,7 @@ static int decrypt_encrypt_aead(lua_State *L, enum enc_dec operation)
 			return luaL_error(L, "auth allocation failed");
 		}
 		memcpy(auth, auth_orig, auth_len);
-	}
-
-	if (operation == ENCODING) {
+	} else {
 		auth_len = key_len;
 		auth = kmalloc(auth_len, GFP_ATOMIC);
 		if (auth == NULL) {
@@ -633,7 +647,7 @@ static int lget_hasher(lua_State *L)
 	tfm = lua_newuserdata(L, sizeof *tfm);
 	tfm->hash_tfm = crypto_alloc_shash(hasher_name, 0, CRYPTO_ALG_ASYNC);
 	if (IS_ERR(tfm->hash_tfm)) {
-		luaL_error(L, "could not allocate %s handle\n", hasher_name);
+		luaL_error(L, "could not allocate %s handle", hasher_name);
 	}
 	if (luaL_newmetatable(L, CUJO_HASHER_TFM_LUA_NAME)) {
 		luaL_setfuncs(L, hasher_funcs, 0);
@@ -672,18 +686,18 @@ static int lget_cipher(lua_State *L)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
 	tfm->tfm = crypto_alloc_skcipher(cipher_name, 0, CRYPTO_ALG_ASYNC);
 	if (IS_ERR(tfm->tfm)) {
-		luaL_error(L, "could not allocate %s handle\n", cipher_name);
+		luaL_error(L, "could not allocate %s handle", cipher_name);
 	}
 	tfm->req = skcipher_request_alloc(tfm->tfm, GFP_ATOMIC);
 	if (!tfm->req) {
 		crypto_free_skcipher(tfm->tfm);
-		luaL_error(L, "could not allocate request handle\n");
+		luaL_error(L, "could not allocate request handle");
 	}
 #else
 	tfm->desc.tfm =
 		crypto_alloc_blkcipher(cipher_name, 0, CRYPTO_ALG_ASYNC);
 	if (IS_ERR(tfm->desc.tfm)) {
-		luaL_error(L, "could not allocate %s handle\n", cipher_name);
+		luaL_error(L, "could not allocate %s handle", cipher_name);
 	}
 #endif
 
@@ -711,13 +725,13 @@ static int lget_cipher_aead(lua_State *L)
 
 	tfm->tfm = crypto_alloc_aead(cipher_name, 0, CRYPTO_ALG_ASYNC);
 	if (IS_ERR(tfm->tfm)) {
-		luaL_error(L, "could not allocate %s handle\n", cipher_name);
+		luaL_error(L, "could not allocate %s handle", cipher_name);
 	}
 
 	tfm->req = aead_request_alloc(tfm->tfm, GFP_ATOMIC);
 	if (!tfm->req) {
 		crypto_free_aead(tfm->tfm);
-		luaL_error(L, "could not allocate request handle\n");
+		luaL_error(L, "could not allocate request handle");
 	}
 
 	if (luaL_newmetatable(L, CUJO_CIPHER_AEAD_TFM_LUA_NAME)) {
