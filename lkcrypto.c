@@ -18,21 +18,31 @@
 #include <crypto/hash.h>
 #include <crypto/aes.h>
 #include <crypto/sha.h>
+#include <crypto/aead.h>
 
-#define MAX_NAME_LEN 15
+#define MAX_NAME_LEN  15
+#define MAX_AUTH_SIZE AES_MAX_KEY_SIZE
 
 static const char CUJO_CIPHER_TFM_LUA_NAME[] = "cipher_tfm";
+static const char CUJO_CIPHER_AEAD_TFM_LUA_NAME[] = "cipher_aead_tfm";
 static const char CUJO_HASHER_TFM_LUA_NAME[] = "hasher_tfm";
 
 static DECLARE_COMPLETION(hasher_needs_init);
 static DECLARE_COMPLETION(cipher_needs_init);
+static DECLARE_COMPLETION(cipher_aead_needs_init);
 
-enum { CIPHER, HASHER };
+enum { CIPHER, CIPHER_AEAD, HASHER };
 enum {
 	INIT,
 	IN_PROGRESS,
 	READY,
 };
+
+enum enc_dec {
+	DECODING,
+	ENCODING,
+};
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 18, 0)
 #define SHASH_DESC_ON_STACK(shash, ctx)                                         \
 	char __##shash##_desc[sizeof(struct shash_desc) +                       \
@@ -80,7 +90,15 @@ struct cipher_tfm_t {
 #endif
 };
 
+struct cipher_aead_tfm_t {
+	struct crypto_aead *tfm;
+	struct aead_request *req;
+};
+
 struct hash_lock_t cipher = {
+	0,
+};
+struct hash_lock_t cipher_aead = {
 	0,
 };
 struct hash_lock_t hash = {
@@ -88,6 +106,7 @@ struct hash_lock_t hash = {
 };
 
 LIST_HEAD(cipher_names_list);
+LIST_HEAD(cipher_aead_names_list);
 LIST_HEAD(hasher_names_list);
 
 static int get_status(struct hash_lock_t *state)
@@ -120,7 +139,7 @@ static void delete_list_items(struct list_head *name_list)
 
 static int enc_dec(struct cipher_tfm_t *tfm, const u8 *key, size_t key_len,
 		   u8 *iv, size_t iv_len, const u8 *input_buffer,
-		   size_t input_buffer_len, int encdec)
+		   size_t input_buffer_len, enum enc_dec operation)
 {
 	struct cipher_def def;
 	int ret = 0;
@@ -155,12 +174,12 @@ static int enc_dec(struct cipher_tfm_t *tfm, const u8 *key, size_t key_len,
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
-	if (encdec)
+	if (operation == ENCODING)
 		ret = crypto_skcipher_encrypt(def.req);
 	else
 		ret = crypto_skcipher_decrypt(def.req);
 #else
-	if (encdec)
+	if (operation == ENCODING)
 		ret = crypto_blkcipher_encrypt(&def.desc, &def.sg, &def.sg,
 					       input_buffer_len);
 	else
@@ -171,7 +190,72 @@ static int enc_dec(struct cipher_tfm_t *tfm, const u8 *key, size_t key_len,
 	return ret;
 }
 
-static int decrypt_encrypt(lua_State *L, int dec_enc)
+static int enc_dec_aead(struct cipher_aead_tfm_t *tfm, const u8 *key,
+			size_t key_len, u8 *iv, size_t iv_len, u8 *auth,
+			size_t auth_len, u8 *aad, size_t aad_len,
+			u8 *input_buffer, size_t input_buffer_len,
+			enum enc_dec operation)
+{
+	int ret = 0;
+	struct scatterlist sg[3];
+
+	ret = crypto_aead_setkey(tfm->tfm, key, key_len);
+	if (ret) {
+		return ret;
+	}
+	ret = crypto_aead_setauthsize(tfm->tfm, auth_len);
+	if (ret) {
+		return ret;
+	}
+	//!Important!
+	//It is desired to have stack allocated buffers
+	//for small fixed-size scatterted lists but it is not working
+	//properly on some platfroms(for instance KVMs)
+	//the reason behind it is not fully investigated but the problem (likely)
+	//is incorrect virt memory address for stack allocated memory and thus
+	//sg_set_buf crashes
+	//The root cause could be easily verified with CONFIG_DEBUG_SG enalbed
+	//so BUG_ON(!virt_addr_valid(buf)); would fire
+	//thus for all sg_set_buf operations we use only heap allocated memory
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 0)
+	if (aad_len > 0) {
+		sg_init_table(sg, 3);
+		sg_set_buf(&sg[0], aad, aad_len);
+		sg_set_buf(&sg[1], input_buffer, input_buffer_len);
+		sg_set_buf(&sg[2], auth, auth_len);
+	} else {
+		sg_init_table(sg, 2);
+		sg_set_buf(&sg[0], input_buffer, input_buffer_len);
+		sg_set_buf(&sg[1], auth, auth_len);
+	}
+
+	aead_request_set_ad(tfm->req, aad_len);
+#else
+	struct scatterlist asg;
+	sg_init_table(sg, 2);
+	sg_set_buf(&sg[0], input_buffer, input_buffer_len);
+	sg_set_buf(&sg[1], auth, auth_len);
+	if (aad_len > 0) {
+		sg_init_one(&asg, aad, aad_len);
+	}
+	aead_request_set_assoc(tfm->req, &asg, aad_len);
+#endif
+	if (operation == ENCODING) {
+		aead_request_set_crypt(tfm->req, sg, sg, input_buffer_len, iv);
+	} else {
+		aead_request_set_crypt(tfm->req, sg, sg,
+				       input_buffer_len + auth_len, iv);
+	}
+
+	if (operation == ENCODING) {
+		ret = crypto_aead_encrypt(tfm->req);
+	} else {
+		ret = crypto_aead_decrypt(tfm->req);
+	}
+	return ret;
+}
+
+static int decrypt_encrypt(lua_State *L, enum enc_dec operation)
 {
 	size_t key_len = 0;
 	size_t iv_len = 0;
@@ -198,9 +282,12 @@ static int decrypt_encrypt(lua_State *L, int dec_enc)
 		memcpy(iv, iv_orig, iv_len);
 	}
 	buffer = kmalloc(ciphertext_len, GFP_ATOMIC);
+	if (buffer == NULL) {
+		return luaL_error(L, "buffer allocation failed");
+	}
 	memcpy(buffer, ciphertext, ciphertext_len);
 	result = enc_dec(tfm, key, key_len, iv, iv_len, buffer, ciphertext_len,
-			 dec_enc);
+			 operation);
 
 	if (!result) {
 		lua_pushlstring(L, buffer, ciphertext_len);
@@ -208,8 +295,100 @@ static int decrypt_encrypt(lua_State *L, int dec_enc)
 		return 1;
 	} else {
 		kfree(buffer);
-		return luaL_error(L, "%s failed %d",
-				  dec_enc ? "encrypt" : "decrypt");
+		return luaL_error(L, "%s failed",
+				  operation == ENCODING ? "encrypt" :
+							  "decrypt");
+	}
+}
+
+static int decrypt_encrypt_aead(lua_State *L, enum enc_dec operation)
+{
+	size_t key_len = 0;
+	size_t iv_len = 0;
+	size_t auth_len = 0;
+	size_t ciphertext_len = 0;
+	size_t aad_len = 0;
+
+	int result = 0;
+	int nargs = 0;
+	int aad_arg = operation == ENCODING ? 5 : 6;
+	const u8 *key;
+	const u8 *iv_orig;
+	const u8 *auth_orig;
+	const u8 *aad_orig;
+	const u8 *ciphertext;
+	u8 iv[AES_MAX_KEY_SIZE] = {
+		0,
+	};
+	u8 *auth = NULL;
+	u8 *buffer = NULL;
+	u8 *aad = NULL;
+
+	struct cipher_aead_tfm_t *tfm = NULL;
+
+	nargs = lua_gettop(L);
+
+	tfm = luaL_checkudata(L, 1, CUJO_CIPHER_AEAD_TFM_LUA_NAME);
+	key = luaL_checklstring(L, 2, &key_len);
+	ciphertext = luaL_checklstring(L, 3, &ciphertext_len);
+	iv_orig = luaL_checklstring(L, 4, &iv_len);
+	memcpy(iv, iv_orig, iv_len);
+	if (operation == DECODING) {
+		auth_orig = luaL_checklstring(L, 5, &auth_len);
+		auth = kmalloc(auth_len, GFP_ATOMIC);
+		if (auth == NULL) {
+			return luaL_error(L, "auth allocation failed");
+		}
+		memcpy(auth, auth_orig, auth_len);
+	} else {
+		auth_len = key_len;
+		auth = kmalloc(auth_len, GFP_ATOMIC);
+		if (auth == NULL) {
+			return luaL_error(L, "auth allocation failed");
+		}
+	}
+
+	aad_orig = luaL_checklstring(L, aad_arg, &aad_len);
+	aad = kmalloc(aad_len, GFP_ATOMIC);
+	if (aad == NULL) {
+		if (auth)
+			kfree(auth);
+		return luaL_error(L, "aad allocation failed");
+	}
+	memcpy(aad, aad_orig, aad_len);
+
+	buffer = kmalloc(ciphertext_len, GFP_ATOMIC);
+	if (buffer == NULL) {
+		if (auth)
+			kfree(auth);
+		if (aad)
+			kfree(aad);
+		return luaL_error(L, "buffer allocation failed");
+	}
+	memcpy(buffer, ciphertext, ciphertext_len);
+
+	result = enc_dec_aead(tfm, key, key_len, iv, iv_len, auth, auth_len,
+			      aad, aad_len, buffer, ciphertext_len, operation);
+	if (aad)
+		kfree(aad);
+
+	if (result) {
+		kfree(buffer);
+		kfree(auth);
+
+		return luaL_error(L, "%s failed",
+				  operation == ENCODING ? "encrypt" :
+							  "decrypt");
+	}
+
+	lua_pushlstring(L, buffer, ciphertext_len);
+	kfree(buffer);
+	if (operation == ENCODING) {
+		lua_pushlstring(L, auth, auth_len);
+		kfree(auth);
+		return 2;
+	} else {
+		return 1;
 	}
 }
 
@@ -268,6 +447,8 @@ static int cache_warm(int tfm_type, struct hash_lock_t *state,
 		if (tfm_type == HASHER) {
 			tfm = crypto_alloc_shash(tmp->name, 0,
 						 CRYPTO_ALG_ASYNC);
+		} else if (tfm_type == CIPHER_AEAD) {
+			tfm = crypto_alloc_aead(tmp->name, 0, CRYPTO_ALG_ASYNC);
 		} else {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
 			tfm = crypto_alloc_skcipher(tmp->name, 0,
@@ -284,6 +465,8 @@ static int cache_warm(int tfm_type, struct hash_lock_t *state,
 		}
 		if (tfm_type == HASHER) {
 			crypto_free_shash(tfm);
+		} else if (tfm_type == CIPHER_AEAD) {
+			crypto_free_aead(tfm);
 		} else {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
 			crypto_free_skcipher(tfm);
@@ -304,10 +487,19 @@ static int hasher_cache_warm(void *arg)
 		return cache_warm(HASHER, &hash, &hasher_names_list);
 	return -1;
 }
+
 static int cipher_cache_warm(void *arg)
 {
 	if (!wait_for_completion_killable(&cipher_needs_init))
 		return cache_warm(CIPHER, &cipher, &cipher_names_list);
+	return -1;
+}
+
+static int cipher_aead_cache_warm(void *arg)
+{
+	if (!wait_for_completion_killable(&cipher_aead_needs_init))
+		return cache_warm(CIPHER_AEAD, &cipher_aead,
+				  &cipher_aead_names_list);
 	return -1;
 }
 
@@ -316,7 +508,7 @@ static int ldecrypt(lua_State *L)
 	if (get_status(&cipher) != READY)
 		return 0;
 
-	return decrypt_encrypt(L, 0);
+	return decrypt_encrypt(L, DECODING);
 }
 
 static int lencrypt(lua_State *L)
@@ -324,7 +516,23 @@ static int lencrypt(lua_State *L)
 	if (get_status(&cipher) != READY)
 		return 0;
 
-	return decrypt_encrypt(L, 1);
+	return decrypt_encrypt(L, ENCODING);
+}
+
+static int ldecrypt_aead(lua_State *L)
+{
+	if (get_status(&cipher_aead) != READY)
+		return 0;
+
+	return decrypt_encrypt_aead(L, DECODING);
+}
+
+static int lencrypt_aead(lua_State *L)
+{
+	if (get_status(&cipher_aead) != READY)
+		return 0;
+
+	return decrypt_encrypt_aead(L, ENCODING);
 }
 
 static int init(lua_State *L, struct hash_lock_t *state, struct list_head *list,
@@ -380,6 +588,12 @@ static int init_cipher(lua_State *L)
 	return init(L, &cipher, &cipher_names_list, &cipher_needs_init);
 }
 
+static int init_cipher_aead(lua_State *L)
+{
+	return init(L, &cipher_aead, &cipher_aead_names_list,
+		    &cipher_aead_needs_init);
+}
+
 static int init_hasher(lua_State *L)
 {
 	return init(L, &hash, &hasher_names_list, &hasher_needs_init);
@@ -393,8 +607,17 @@ static int cipher_tfm_gc(lua_State *L)
 	skcipher_request_free(tfm->req);
 	crypto_free_skcipher(tfm->tfm);
 #else
-	crypto_free_cipher(tfm->desc.tfm);
+	crypto_free_blkcipher(tfm->desc.tfm);
 #endif
+	return 0;
+}
+
+static int cipher_aead_tfm_gc(lua_State *L)
+{
+	struct cipher_aead_tfm_t *tfm =
+		luaL_checkudata(L, 1, CUJO_CIPHER_AEAD_TFM_LUA_NAME);
+	crypto_free_aead(tfm->tfm);
+	aead_request_free(tfm->req);
 	return 0;
 }
 
@@ -424,7 +647,7 @@ static int lget_hasher(lua_State *L)
 	tfm = lua_newuserdata(L, sizeof *tfm);
 	tfm->hash_tfm = crypto_alloc_shash(hasher_name, 0, CRYPTO_ALG_ASYNC);
 	if (IS_ERR(tfm->hash_tfm)) {
-		luaL_error(L, "could not allocate %s handle\n", hasher_name);
+		luaL_error(L, "could not allocate %s handle", hasher_name);
 	}
 	if (luaL_newmetatable(L, CUJO_HASHER_TFM_LUA_NAME)) {
 		luaL_setfuncs(L, hasher_funcs, 0);
@@ -442,6 +665,13 @@ static const luaL_Reg cipher_funcs[] = {
 	{ NULL, NULL },
 };
 
+static const luaL_Reg cipher_aead_funcs[] = {
+	{ "decrypt", ldecrypt_aead },
+	{ "encrypt", lencrypt_aead },
+	{ "__gc", cipher_aead_tfm_gc },
+	{ NULL, NULL },
+};
+
 static int lget_cipher(lua_State *L)
 {
 	size_t cipher_name_len = 0;
@@ -456,18 +686,18 @@ static int lget_cipher(lua_State *L)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
 	tfm->tfm = crypto_alloc_skcipher(cipher_name, 0, CRYPTO_ALG_ASYNC);
 	if (IS_ERR(tfm->tfm)) {
-		luaL_error(L, "could not allocate %s handle\n", cipher_name);
+		luaL_error(L, "could not allocate %s handle", cipher_name);
 	}
 	tfm->req = skcipher_request_alloc(tfm->tfm, GFP_ATOMIC);
 	if (!tfm->req) {
 		crypto_free_skcipher(tfm->tfm);
-		luaL_error(L, "could not allocate request handle\n");
+		luaL_error(L, "could not allocate request handle");
 	}
 #else
 	tfm->desc.tfm =
 		crypto_alloc_blkcipher(cipher_name, 0, CRYPTO_ALG_ASYNC);
 	if (IS_ERR(tfm->desc.tfm)) {
-		luaL_error(L, "could not allocate %s handle\n", cipher_name);
+		luaL_error(L, "could not allocate %s handle", cipher_name);
 	}
 #endif
 
@@ -480,10 +710,45 @@ static int lget_cipher(lua_State *L)
 	return 1;
 }
 
+static int lget_cipher_aead(lua_State *L)
+{
+	size_t cipher_name_len = 0;
+	const u8 *cipher_name;
+	struct cipher_aead_tfm_t *tfm = NULL;
+	if (get_status(&cipher_aead) != READY) {
+		printk("Not ready error\n");
+		return 0;
+	}
+	cipher_name = luaL_checklstring(L, 1, &cipher_name_len);
+
+	tfm = lua_newuserdata(L, sizeof *tfm);
+
+	tfm->tfm = crypto_alloc_aead(cipher_name, 0, CRYPTO_ALG_ASYNC);
+	if (IS_ERR(tfm->tfm)) {
+		luaL_error(L, "could not allocate %s handle", cipher_name);
+	}
+
+	tfm->req = aead_request_alloc(tfm->tfm, GFP_ATOMIC);
+	if (!tfm->req) {
+		crypto_free_aead(tfm->tfm);
+		luaL_error(L, "could not allocate request handle");
+	}
+
+	if (luaL_newmetatable(L, CUJO_CIPHER_AEAD_TFM_LUA_NAME)) {
+		luaL_setfuncs(L, cipher_aead_funcs, 0);
+		lua_pushvalue(L, -1);
+		lua_setfield(L, -2, "__index");
+	}
+	lua_setmetatable(L, -2);
+	return 1;
+}
+
 static const luaL_Reg kcrypto[] = {
 	{ "init_cipher", init_cipher },
 	{ "init_hasher", init_hasher },
+	{ "init_cipher_aead", init_cipher_aead },
 	{ "get_cipher", lget_cipher },
+	{ "get_cipher_aead", lget_cipher_aead },
 	{ "get_hasher", lget_hasher },
 	{ NULL, NULL },
 };
@@ -496,10 +761,13 @@ int luaopen_kcrypto(lua_State *L)
 static int __init modinit(void)
 {
 	kthread_run(cipher_cache_warm, NULL, "cipher_cache_warm");
+	kthread_run(cipher_aead_cache_warm, NULL, "cipher_aead_cache_warm");
 	kthread_run(hasher_cache_warm, NULL, "hasher_cache_warm");
 	spin_lock_init(&hash.lock);
 	spin_lock_init(&cipher.lock);
+	spin_lock_init(&cipher_aead.lock);
 	set_status(&cipher, INIT);
+	set_status(&cipher_aead, INIT);
 	set_status(&hash, INIT);
 	return 0;
 }
