@@ -20,7 +20,7 @@
 #include <crypto/sha.h>
 #include <crypto/aead.h>
 
-#define MAX_NAME_LEN  15
+#define MAX_NAME_LEN  63
 #define MAX_AUTH_SIZE AES_MAX_KEY_SIZE
 
 static const char CUJO_CIPHER_TFM_LUA_NAME[] = "cipher_tfm";
