@@ -295,9 +295,9 @@ static int decrypt_encrypt(lua_State *L, enum enc_dec operation)
 		return 1;
 	} else {
 		kfree(buffer);
-		return luaL_error(L, "%s failed",
-				  operation == ENCODING ? "encrypt" :
-							  "decrypt");
+		pr_debug("%s failed",
+			 operation == ENCODING ? "encrypt" : "decrypt");
+		return 0;
 	}
 }
 
@@ -431,8 +431,10 @@ static int lget_digest(lua_State *L)
 
 	result = get_digest(tfm->hash_tfm, key, key_len, text, _text_len, out);
 
-	if (result)
-		luaL_error(L, "failed to get digest");
+	if (result) {
+		pr_debug("failed to get digest");
+		return 0;
+	}
 
 	lua_pushlstring(L, out, out_len);
 	return 1;
