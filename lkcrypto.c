@@ -17,7 +17,11 @@
 #include <linux/kthread.h>
 #include <crypto/hash.h>
 #include <crypto/aes.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+#include <crypto/sha2.h>
+#else
 #include <crypto/sha.h>
+#endif
 #include <crypto/aead.h>
 
 #define MAX_NAME_LEN  63
