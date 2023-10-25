@@ -557,6 +557,7 @@ static int init(lua_State *L, struct hash_lock_t *state, struct list_head *list,
 		name = luaL_checklstring(L, i, &name_len);
 		if (name_len >= MAX_NAME_LEN + 1) {
 			delete_list_items(list);
+			complete(task);
 			return luaL_error(
 				L,
 				"%s exceeds name length size, MAX_NAME_LEN bump is required!",
@@ -778,6 +779,9 @@ static int __init modinit(void)
 
 static void __exit modexit(void)
 {
+	complete(&cipher_needs_init);
+	complete(&cipher_aead_needs_init);
+	complete(&hasher_needs_init);
 }
 
 module_init(modinit);
