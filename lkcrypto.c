@@ -787,4 +787,4 @@ static void __exit modexit(void)
 module_init(modinit);
 module_exit(modexit);
 MODULE_LICENSE("Dual MIT/GPL");
-EXPORT_SYMBOL(luaopen_kcrypto);
+EXPORT_SYMBOL_GPL(luaopen_kcrypto);
